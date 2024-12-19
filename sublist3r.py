@@ -72,7 +72,7 @@ def no_color():
 
 
 def banner():
-    print("""%s
+    print(r"""%s
 
              __       _     _ _     _   _____
             / _\_   _| |__ | (_)___| |_|___ / _ __
@@ -285,7 +285,7 @@ class GoogleEnum(enumratorBaseThreaded):
 
     def extract_domains(self, resp):
         links_list = list()
-        link_regx = re.compile('<cite.*?>(.*?)<\/cite>')
+        link_regx = re.compile(r'<cite.*?>(.*?)<\/cite>')
         try:
             links_list = link_regx.findall(resp)
             for link in links_list:
@@ -364,7 +364,7 @@ class YahooEnum(enumratorBaseThreaded):
             links2 = link_regx2.findall(resp)
             links_list = links + links2
             for link in links_list:
-                link = re.sub("<(\/)?b>", "", link)
+                link = re.sub(r"<(\/)?b>", "", link)
                 if not link.startswith('http'):
                     link = "http://" + link
                 subdomain = urlparse.urlparse(link).netloc
@@ -460,7 +460,7 @@ class BingEnum(enumratorBaseThreaded):
             links_list = links + links2
 
             for link in links_list:
-                link = re.sub('<(\/)?strong>|<span.*?>|<|>', '', link)
+                link = re.sub(r'<(\/)?strong>|<span.*?>|<|>', '', link)
                 if not link.startswith('http'):
                     link = "http://" + link
                 subdomain = urlparse.urlparse(link).netloc
@@ -619,82 +619,59 @@ class NetcraftEnum(enumratorBaseThreaded):
 
 
 class DNSdumpster(enumratorBaseThreaded):
-    def __init__(self, domain, subdomains=None, q=None, silent=False, verbose=True):
+    def __init__(self, domain, subdomains=None, q=None, silent=False, verbose=True, apikey=None):
         subdomains = subdomains or []
-        base_url = 'https://dnsdumpster.com/'
-        self.live_subdomains = []
-        self.engine_name = "DNSdumpster"
+        self.apikey = apikey or os.environ.get('DNSDUMPSTER_API_KEY')
+        if not self.apikey:
+            print("DNSDUMPSTER_API_KEY environment variable is not set.")
+            self.apikey = self.prompt_for_api_key()
+        self.base_url = 'https://api.dnsdumpster.com/domain/{domain}'
+        self.engine_name = "DNSdumpster API"
         self.q = q
-        self.lock = None
-        super(DNSdumpster, self).__init__(base_url, self.engine_name, domain, subdomains, q=q, silent=silent, verbose=verbose)
-        return
+        super(DNSdumpster, self).__init__(self.base_url, self.engine_name, domain, subdomains, q=q, silent=silent, verbose=verbose)
 
-    def check_host(self, host):
-        is_valid = False
-        Resolver = dns.resolver.Resolver()
-        Resolver.nameservers = ['8.8.8.8', '8.8.4.4']
-        self.lock.acquire()
-        try:
-            ip = Resolver.query(host, 'A')[0].to_text()
-            if ip:
-                if self.verbose:
-                    self.print_("%s%s: %s%s" % (R, self.engine_name, W, host))
-                is_valid = True
-                self.live_subdomains.append(host)
-        except:
-            pass
-        self.lock.release()
-        return is_valid
-
-    def req(self, req_method, url, params=None):
-        params = params or {}
-        headers = dict(self.headers)
-        headers['Referer'] = 'https://dnsdumpster.com'
-        try:
-            if req_method == 'GET':
-                resp = self.session.get(url, headers=headers, timeout=self.timeout)
+    def prompt_for_api_key(self):
+        while True:
+            apikey = input('\033[91m' + "Please enter your DNSdumpster API Key: " + '\033[0m').strip()
+            if apikey:
+                return apikey
             else:
-                resp = self.session.post(url, data=params, headers=headers, timeout=self.timeout)
-        except Exception as e:
-            self.print_(e)
-            resp = None
-        return self.get_response(resp)
+                print('\033[91m' + "API Key cannot be empty. Please provide a valid key." + '\033[0m')
 
-    def get_csrftoken(self, resp):
-        csrf_regex = re.compile('<input type="hidden" name="csrfmiddlewaretoken" value="(.*?)">', re.S)
-        token = csrf_regex.findall(resp)[0]
-        return token.strip()
+    def send_req(self):
+        url = self.base_url.format(domain=self.domain)
+        headers = {'X-API-Key': self.apikey}
+        params = {}  
+        try:
+            response = self.session.get(url, headers=headers, params=params, timeout=self.timeout)
+            if response.status_code == 429:
+                print("[!] Rate limit exceeded. Retrying after 2 seconds...")
+                time.sleep(2)
+                return self.send_req()
+            elif response.status_code != 200:
+                raise Exception(f"Error from DNSdumpster API: HTTP {response.status_code} - {response.text}")
+            return response.json()
+        except Exception as e:
+            self.print_(f"[!] Error: {e}")
+            return None
 
     def enumerate(self):
-        self.lock = threading.BoundedSemaphore(value=70)
-        resp = self.req('GET', self.base_url)
-        token = self.get_csrftoken(resp)
-        params = {'csrfmiddlewaretoken': token, 'targetip': self.domain}
-        post_resp = self.req('POST', self.base_url, params)
-        self.extract_domains(post_resp)
-        for subdomain in self.subdomains:
-            t = threading.Thread(target=self.check_host, args=(subdomain,))
-            t.start()
-            t.join()
-        return self.live_subdomains
+        resp = self.send_req()
+        if resp:
+            self.extract_domains(resp)
+        return self.subdomains
 
     def extract_domains(self, resp):
-        tbl_regex = re.compile('<a name="hostanchor"><\/a>Host Records.*?<table.*?>(.*?)</table>', re.S)
-        link_regex = re.compile('<td class="col-md-4">(.*?)<br>', re.S)
-        links = []
         try:
-            results_tbl = tbl_regex.findall(resp)[0]
-        except IndexError:
-            results_tbl = ''
-        links_list = link_regex.findall(results_tbl)
-        links = list(set(links_list))
-        for link in links:
-            subdomain = link.strip()
-            if not subdomain.endswith(self.domain):
-                continue
-            if subdomain and subdomain not in self.subdomains and subdomain != self.domain:
-                self.subdomains.append(subdomain.strip())
-        return links
+            for record_type in ["a", "cname", "mx", "ns"]:
+                for record in resp.get(record_type, []):
+                    subdomain = record.get("host")
+                    if subdomain and subdomain not in self.subdomains and subdomain.endswith(self.domain):
+                        if self.verbose:
+                            self.print_(f"{self.engine_name}: {subdomain}")
+                        self.subdomains.append(subdomain)
+        except Exception as e:
+            self.print_(f"Error processing response: {e}")
 
 
 class Virustotal(enumratorBaseThreaded):
@@ -916,7 +893,7 @@ def main(domain, threads, savefile, ports, silent, verbose, enable_bruteforce, e
         enable_bruteforce = True
 
     # Validate domain
-    domain_check = re.compile("^(http|https)?[a-zA-Z0-9]+([\-\.]{1}[a-zA-Z0-9]+)*\.[a-zA-Z]{2,}$")
+    domain_check = re.compile(r"^(http|https)?[a-zA-Z0-9]+([\-\.]{1}[a-zA-Z0-9]+)*\.[a-zA-Z]{2,}$")
     if not domain_check.match(domain):
         if not silent:
             print(R + "Error: Please enter a valid domain" + W)
